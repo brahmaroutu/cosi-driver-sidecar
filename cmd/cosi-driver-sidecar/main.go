@@ -25,13 +25,23 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"strconv"
+	"math/rand"
 
 	"google.golang.org/grpc"
 	"k8s.io/klog"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/rest"
+    "k8s.io/client-go/tools/clientcmd"
+    "k8s.io/client-go/informers"
+    "k8s.io/client-go/util/workqueue"
+    "k8s.io/apimachinery/pkg/util/wait"
  
-        "github.com/brahmaroutu/cosi-external-provisioner/controller"
-        "github.com/kubernetes-sigs/cosi-driver-sidecar/pkg/server"
-        "github.com/container-object-storage-interface/spec/lib/go/cosi"
+    "github.com/brahmaroutu/cosi-external-provisioner/controller"
+    "github.com/brahmaroutu/cosi-driver-sidecar/pkg/server"
+    ctrl "github.com/brahmaroutu/cosi-driver-sidecar/pkg/controller"
+    "github.com/container-object-storage-interface/spec/lib/go/cosi"
+    cosiclient  "github.com/container-object-storage-interface/api/clientset"
 )
 
 const (
@@ -43,6 +53,7 @@ const (
 
 	// Interval of logging connection errors
 	connectionLoggingInterval = 10 * time.Second
+
 )
 
 // Command line flags
@@ -51,11 +62,18 @@ var (
 	cosiAddress             = flag.String("cosi-address", "/run/cosi/socket", "Path of the COSI driver socket that the provisioner  will connect to.")
 	showVersion             = flag.Bool("version", false, "Show version.")
 	version                 = "unknown"
-
+        config                  *rest.Config
 	// List of supported versions
 	supportedVersions = []string{"1.0.0"}
 
-        //provisionController *controller.ProvisionController
+    provisionController *controller.ProvisionController
+	operationTimeout     = flag.Duration("timeout", 10*time.Second, "Timeout for waiting for creation or deletion of a volume")
+        retryIntervalStart   = flag.Duration("retry-interval-start", time.Second, "Initial retry interval of failed provisioning or deletion. It doubles with each failure, up to retry-interval-max.")
+        retryIntervalMax     = flag.Duration("retry-interval-max", 5*time.Minute, "Maximum retry interval of failed provisioning or deletion.")
+
+        kubeconfig           = flag.String("kubeconfig", "", "Absolute path to the kubeconfig file. Either this or master needs to be set if the provisioner is being run out of cluster.")
+        master               = flag.String("master", "", "Master URL to build a client config from. Either this or kubeconfig needs to be set if the provisioner is being run out of cluster.")
+
 )
 
 
@@ -91,8 +109,13 @@ func main() {
 		klog.Warning("--connection-timeout is deprecated and will have no effect")
 	}
 
-        cds := server.DriverServer{"testDriver", "1.0"}
-        go Serve(*cosiAddress, "default", cds)
+    cds := server.DriverServer{"testDriver", "1.0"}
+    go Serve(*cosiAddress, "default", cds)
+
+    provisionerName := "testDriver"
+        // Generate a unique ID for this provisioner
+        timeStamp := time.Now().UnixNano() / int64(time.Millisecond)
+    identity := strconv.FormatInt(timeStamp, 10) + "-" + strconv.Itoa(rand.Intn(10000)) + "-" + provisionerName
 
 
 	klog.V(1).Infof("Attempting to open a gRPC connection with: %q", *cosiAddress)
@@ -106,10 +129,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), cosiTimeout)
 	defer cancel()
 
-        fmt.Println("creating Client")
-        client := cosi.NewCOSIDriverClient(cosiConn)
+    fmt.Println("creating Client")
+    client := cosi.NewCOSIDriverClient(cosiConn)
 	req := cosi.CreateBucketRequest{Name: "testBucket"}
-        fmt.Println("call CreateBucket")
+    fmt.Println("call CreateBucket")
 	rsp, err := client.CreateBucket(ctx, &req)
         fmt.Println("Got response")
 	if err != nil {
@@ -119,14 +142,73 @@ func main() {
 	}
 
 	fmt.Println("COSI CreateBucket returned : %v", rsp.Bucket)
-/*
+
+        // get the KUBECONFIG from env if specified (useful for local/debug cluster)
+        kubeconfigEnv := os.Getenv("KUBECONFIG")
+
+        if kubeconfigEnv != "" {
+                klog.Infof("Found KUBECONFIG environment variable set, using that..")
+                kubeconfig = &kubeconfigEnv
+        }
+
+        if *master != "" || *kubeconfig != "" {
+                klog.Infof("Either master or kubeconfig specified. building kube config from that..")
+                config, err = clientcmd.BuildConfigFromFlags(*master, *kubeconfig)
+        } else {
+                klog.Infof("Building kube configs for running in cluster...")
+                config, err = rest.InClusterConfig()
+        }
+        if err != nil {
+                klog.Fatalf("Failed to create config: %v", err)
+        }
+        //fmt.Println("config ", config)
+        clientset, err := kubernetes.NewForConfig(config)
+        if err != nil {
+                klog.Fatalf("Failed to create client: %v", err)
+        }
+        
+        cosiclient, err := cosiclient.NewForConfig(config)
+        if err != nil {
+                klog.Fatalf("Failed to create client: %v", err)
+        }
+
+        // The controller needs to know what the server version is because out-of-tree
+        // provisioners aren't officially supported until 1.5
+        serverVersion, err := clientset.Discovery().ServerVersion()
+        if err != nil {
+                klog.Fatalf("Error getting server version: %v", err)
+        }
+
+        // Create the provisioner: it implements the Provisioner interface expected by
+        // the controller
+        cosiProvisioner := ctrl.NewCOSIProvisioner(
+                clientset,
+                cosiclient,
+                *operationTimeout,
+                identity,
+                cosiConn,
+                provisionerName,
+//                pluginCapabilities,
+//                controllerCapabilities,
+        )
+
+        provisionerOptions := []func(*controller.ProvisionController) error{
+                controller.FailedProvisionThreshold(0),
+                controller.FailedDeleteThreshold(0),
+                controller.RateLimiter(workqueue.NewItemExponentialFailureRateLimiter(*retryIntervalStart, *retryIntervalMax)),
+//                controller.CreateProvisionedPVLimiter(workqueue.DefaultControllerRateLimiter()),
+        }
+
 	provisionController = controller.NewProvisionController(
 		clientset,
-		provisionerName,
-		csiProvisioner,
+		cosiclient,
+		"testDriver", // srini: we need to obtain this from the API
+		cosiProvisioner,
 		serverVersion.GitVersion,
 		provisionerOptions...,
 	)
+
+        factory := informers.NewSharedInformerFactory(clientset, ctrl.ResyncPeriodOfCOSINodeInformer)
 
 	run := func(context.Context) {
 		stopCh := context.Background().Done()
@@ -140,7 +222,9 @@ func main() {
 
 		provisionController.Run(wait.NeverStop)
 	}
-*/
+	run(context.TODO())
+        fmt.Println("Sleep now")
+        time.Sleep(1000 * time.Millisecond)
 }
 
 func Serve(endpoint, ns string, cds cosi.COSIDriverServer ) {
